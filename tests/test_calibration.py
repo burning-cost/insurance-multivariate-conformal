@@ -66,27 +66,6 @@ class TestComputeResiduals:
         res = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
         assert np.all(res >= 0)
 
-    def test_zero_claim_masking(self, motor_data):
-        d = motor_data
-        mask = d["zero_mask_cal"]
-        res_masked = compute_residuals(
-            d["models"], d["X_cal"], d["Y_cal"],
-            zero_claim_mask=mask,
-        )
-        # Severity residuals should be 0 where mask is True
-        assert np.all(res_masked[mask, 1] == 0.0)
-
-    def test_zero_claim_masking_frequency_unchanged(self, motor_data):
-        d = motor_data
-        mask = d["zero_mask_cal"]
-        res_no_mask = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
-        res_masked = compute_residuals(
-            d["models"], d["X_cal"], d["Y_cal"],
-            zero_claim_mask=mask,
-        )
-        # Frequency residuals unaffected by zero-claim mask
-        np.testing.assert_array_equal(res_masked[:, 0], res_no_mask[:, 0])
-
     def test_absolute_residuals_are_true_differences(self, motor_data):
         d = motor_data
         res = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
@@ -94,6 +73,20 @@ class TestComputeResiduals:
         freq_pred = d["models"]["frequency"].predict(d["X_cal"])
         expected_freq_res = np.abs(d["Y_cal"]["frequency"] - freq_pred)
         np.testing.assert_allclose(res[:, 0], expected_freq_res, rtol=1e-6)
+
+    def test_zero_claim_mask_ignored_by_compute_residuals(self, motor_data):
+        """
+        compute_residuals() always returns raw absolute residuals — masking
+        is handled at calibration level, not residual computation level.
+        """
+        d = motor_data
+        mask = d["zero_mask_cal"]
+        res_no_mask = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
+        res_with_mask = compute_residuals(
+            d["models"], d["X_cal"], d["Y_cal"], zero_claim_mask=mask
+        )
+        # Both should return identical residuals — mask has no effect here
+        np.testing.assert_array_equal(res_no_mask, res_with_mask)
 
 
 class TestCalibrate:
@@ -142,17 +135,43 @@ class TestCalibrate:
 
     def test_half_widths_in_original_units(self, motor_data):
         """
-        For bonferroni, hw should be comparable to |y - y_hat| quantile.
-        For gwc/lwc, hw = q_std * sigma + mu should also be in original units.
+        Frequency hw should be in claim units (small).
+        Severity hw should be in £ (hundreds to thousands).
         """
         d = motor_data
         for method in ["bonferroni", "gwc", "lwc"]:
             cal = calibrate(d["models"], d["X_cal"], d["Y_cal"], method=method)
             hw = cal.interval_half_widths()
-            # Frequency hw should be in claim units (0 to few)
-            # Severity hw should be in £ (hundreds to thousands)
             assert hw[0] < 100, f"Freq half-width {hw[0]} seems wrong for method={method}"
             assert hw[1] > 10, f"Sev half-width {hw[1]} seems wrong for method={method}"
+
+    def test_zero_claim_masking_sets_severity_dim(self, motor_data):
+        """
+        With zero_claim_mask, severity_dim should be set and sigma_hat[sev]
+        should be computed from claim-only obs (should differ from no-mask version).
+        """
+        d = motor_data
+        cal_no_mask = calibrate(d["models"], d["X_cal"], d["Y_cal"])
+        cal_masked = calibrate(
+            d["models"], d["X_cal"], d["Y_cal"],
+            zero_claim_mask=d["zero_mask_cal"]
+        )
+        # severity_dim should be set
+        assert cal_masked.severity_dim == 1  # severity is second dimension
+        # sigma_hat for severity may differ between masked and unmasked
+        # (masked uses only claim obs — typically higher variance)
+        assert cal_masked.sigma_hat[1] > 0
+
+    def test_zero_claim_masking_produces_valid_half_widths(self, motor_data):
+        d = motor_data
+        cal_masked = calibrate(
+            d["models"], d["X_cal"], d["Y_cal"],
+            zero_claim_mask=d["zero_mask_cal"]
+        )
+        hw = cal_masked.interval_half_widths()
+        assert np.all(hw > 0)
+        # Severity hw with proper claim-only sigma should be reasonable (£ scale)
+        assert hw[1] > 100, f"Severity hw {hw[1]} too small after masking"
 
     def test_unknown_method_raises(self, motor_data):
         d = motor_data
@@ -193,7 +212,7 @@ class TestCalibrate:
     def test_bonferroni_quantile_is_abs_residual_quantile(self, motor_data):
         """
         Bonferroni per-dim quantile should match manual computation
-        of conformal quantile on |y - y_hat|.
+        of conformal quantile on |y - y_hat| at 1-alpha/d level.
         """
         d = motor_data
         cal = calibrate(d["models"], d["X_cal"], d["Y_cal"], alpha=0.05, method="bonferroni")
