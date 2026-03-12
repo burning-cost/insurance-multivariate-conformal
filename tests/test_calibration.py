@@ -58,24 +58,12 @@ class TestNormaliseY:
 class TestComputeResiduals:
     def test_basic_shape(self, motor_data):
         d = motor_data
-        res = compute_residuals(
-            d["models"], d["X_cal"], d["Y_cal"], score_fn="absolute"
-        )
+        res = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
         assert res.shape == (d["n_cal"], 2)
 
     def test_nonnegative(self, motor_data):
         d = motor_data
-        res = compute_residuals(
-            d["models"], d["X_cal"], d["Y_cal"], score_fn="absolute"
-        )
-        assert np.all(res >= 0)
-
-    def test_auto_score_fn(self, motor_data):
-        d = motor_data
-        res = compute_residuals(
-            d["models"], d["X_cal"], d["Y_cal"], score_fn="auto"
-        )
-        assert res.shape == (d["n_cal"], 2)
+        res = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
         assert np.all(res >= 0)
 
     def test_zero_claim_masking(self, motor_data):
@@ -83,7 +71,6 @@ class TestComputeResiduals:
         mask = d["zero_mask_cal"]
         res_masked = compute_residuals(
             d["models"], d["X_cal"], d["Y_cal"],
-            score_fn="auto",
             zero_claim_mask=mask,
         )
         # Severity residuals should be 0 where mask is True
@@ -92,21 +79,21 @@ class TestComputeResiduals:
     def test_zero_claim_masking_frequency_unchanged(self, motor_data):
         d = motor_data
         mask = d["zero_mask_cal"]
-        res_no_mask = compute_residuals(
-            d["models"], d["X_cal"], d["Y_cal"], score_fn="auto"
-        )
+        res_no_mask = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
         res_masked = compute_residuals(
             d["models"], d["X_cal"], d["Y_cal"],
-            score_fn="auto",
             zero_claim_mask=mask,
         )
         # Frequency residuals unaffected by zero-claim mask
         np.testing.assert_array_equal(res_masked[:, 0], res_no_mask[:, 0])
 
-    def test_unknown_score_fn_raises(self, motor_data):
+    def test_absolute_residuals_are_true_differences(self, motor_data):
         d = motor_data
-        with pytest.raises(ValueError, match="Unknown score_fn"):
-            compute_residuals(d["models"], d["X_cal"], d["Y_cal"], score_fn="bad")
+        res = compute_residuals(d["models"], d["X_cal"], d["Y_cal"])
+        # Spot-check: residual_j should be |y_j - y_hat_j|
+        freq_pred = d["models"]["frequency"].predict(d["X_cal"])
+        expected_freq_res = np.abs(d["Y_cal"]["frequency"] - freq_pred)
+        np.testing.assert_allclose(res[:, 0], expected_freq_res, rtol=1e-6)
 
 
 class TestCalibrate:
@@ -153,6 +140,20 @@ class TestCalibrate:
             hw = cal.interval_half_widths()
             assert np.all(hw > 0), f"Non-positive half-widths for method={method}"
 
+    def test_half_widths_in_original_units(self, motor_data):
+        """
+        For bonferroni, hw should be comparable to |y - y_hat| quantile.
+        For gwc/lwc, hw = q_std * sigma + mu should also be in original units.
+        """
+        d = motor_data
+        for method in ["bonferroni", "gwc", "lwc"]:
+            cal = calibrate(d["models"], d["X_cal"], d["Y_cal"], method=method)
+            hw = cal.interval_half_widths()
+            # Frequency hw should be in claim units (0 to few)
+            # Severity hw should be in £ (hundreds to thousands)
+            assert hw[0] < 100, f"Freq half-width {hw[0]} seems wrong for method={method}"
+            assert hw[1] > 10, f"Sev half-width {hw[1]} seems wrong for method={method}"
+
     def test_unknown_method_raises(self, motor_data):
         d = motor_data
         with pytest.raises(ValueError, match="Unknown method"):
@@ -188,3 +189,19 @@ class TestCalibrate:
         cal = calibrate(d["models"], d["X_cal"], d["Y_cal"])
         ms = cal.max_scores()
         assert ms.shape == (d["n_cal"],)
+
+    def test_bonferroni_quantile_is_abs_residual_quantile(self, motor_data):
+        """
+        Bonferroni per-dim quantile should match manual computation
+        of conformal quantile on |y - y_hat|.
+        """
+        d = motor_data
+        cal = calibrate(d["models"], d["X_cal"], d["Y_cal"], alpha=0.05, method="bonferroni")
+        hw = cal.interval_half_widths()
+
+        # Manual: frequency quantile at 1 - alpha/2 = 0.975 level
+        n = d["n_cal"]
+        k = min(int(np.ceil((n + 1) * (1.0 - 0.05 / 2))), n)
+        freq_res = cal.residuals[:, 0]
+        expected_hw = np.sort(freq_res)[k - 1]
+        assert hw[0] == pytest.approx(expected_hw, rel=1e-6)
