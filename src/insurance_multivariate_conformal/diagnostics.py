@@ -118,11 +118,7 @@ def compare_methods(
     Calibrate and evaluate multiple methods on the same cal/test split.
 
     Returns a dict: method -> coverage_report dict.
-
-    Useful for showing LWC efficiency gains over Bonferroni on real data.
     """
-    from .predictor import JointConformalPredictor
-
     if methods is None:
         methods = ["bonferroni", "gwc", "lwc"]
 
@@ -159,58 +155,82 @@ def calibration_plot(
     except ImportError:
         raise ImportError("matplotlib required for calibration_plot()")
 
-    from .predictor import JointConformalPredictor
+    from .calibration import calibrate as _cal_fn, CalibratedScores
 
-    alphas = np.linspace(0.01, 0.30, 30)
+    alphas = np.linspace(0.01, 0.30, 20)
     joint_coverages = []
     marginal_coverages_by_dim: Dict[str, List[float]] = {
         k: [] for k in predictor.dimensions_
     }
 
-    # Re-calibrate at each alpha level using the same calibration data
+    # Re-calibrate at each alpha using the original calibration data
     cal_data = predictor.calibrated_scores_
+
     for a in alphas:
-        from .calibration import calibrate as _cal
-        new_cal = _cal(
-            models=predictor.models,
-            X_cal=np.zeros((cal_data.n_cal, 1)),  # placeholder — we recalibrate
-            Y_cal={k: np.zeros(cal_data.n_cal) for k in cal_data.dimensions},
-            alpha=a,
-            method=predictor.method,
-        )
-        # Actually: we can compute coverage directly from stored residuals
-        # by finding new thresholds on the stored residual matrix
-        from .methods import lwc_quantile_exact, gwc_quantile, bonferroni_quantile
-        res = cal_data.residuals
-        n = cal_data.n_cal
-
-        if predictor.method == "lwc":
-            thresholds, mu_hat, sigma_hat = lwc_quantile_exact(res, a)
-        elif predictor.method == "gwc":
-            q, mu_hat, sigma_hat = gwc_quantile(res, a)
-            thresholds = np.full(len(cal_data.dimensions), q)
-        else:
-            thresholds = bonferroni_quantile(res, a)
-            mu_hat = cal_data.mu_hat
-            sigma_hat = cal_data.sigma_hat
-
-        # Predict on test with these thresholds
         tmp_pred = JointConformalPredictor(
             models=predictor.models, alpha=a, method=predictor.method
         )
-        from copy import deepcopy
-        from .calibration import CalibratedScores
-        tmp_pred.calibrated_scores_ = CalibratedScores(
-            dimensions=cal_data.dimensions,
-            residuals=cal_data.residuals,
-            mu_hat=mu_hat,
-            sigma_hat=sigma_hat,
-            n_cal=n,
-            method=predictor.method,
-            alpha=a,
-            thresholds=thresholds if predictor.method in ("gwc", "lwc") else None,
-            per_dim_quantiles=thresholds if predictor.method in ("bonferroni", "sidak") else None,
+        # Reconstruct a placeholder X_cal to trigger calibration
+        # by creating a CalibratedScores object directly
+        from .calibration import (
+            _gwc_with_masked_scores,
+            _lwc_with_masked_scores,
+            _compute_standardization_stats,
         )
+        from .methods import bonferroni_quantile, sidak_quantile
+
+        res = cal_data.residuals
+        n = cal_data.n_cal
+        d = len(cal_data.dimensions)
+        zcm = cal_data.zero_claim_mask
+        sdim = cal_data.severity_dim
+
+        if predictor.method == "lwc":
+            thresholds, mu_hat, sigma_hat = _lwc_with_masked_scores(
+                res, a, zero_claim_mask=zcm, severity_dim=sdim
+            )
+            tmp_scores = CalibratedScores(
+                dimensions=cal_data.dimensions, residuals=res,
+                mu_hat=mu_hat, sigma_hat=sigma_hat, n_cal=n,
+                method=predictor.method, alpha=a,
+                zero_claim_mask=zcm, severity_dim=sdim,
+                thresholds=thresholds,
+            )
+        elif predictor.method == "gwc":
+            q, mu_hat, sigma_hat = _gwc_with_masked_scores(
+                res, a, zero_claim_mask=zcm, severity_dim=sdim
+            )
+            tmp_scores = CalibratedScores(
+                dimensions=cal_data.dimensions, residuals=res,
+                mu_hat=mu_hat, sigma_hat=sigma_hat, n_cal=n,
+                method=predictor.method, alpha=a,
+                zero_claim_mask=zcm, severity_dim=sdim,
+                thresholds=np.full(d, q),
+            )
+        else:
+            alpha_per_dim = a / d
+            level = 1.0 - alpha_per_dim
+            per_dim_q = np.zeros(d)
+            keys = cal_data.dimensions
+            for j, key in enumerate(keys):
+                if zcm is not None and key == "severity":
+                    claim_mask = ~zcm
+                    res_j = res[claim_mask, j] if claim_mask.sum() > 0 else res[:, j]
+                else:
+                    res_j = res[:, j]
+                n_j = len(res_j)
+                k_j = min(int(np.ceil((n_j + 1) * level)), n_j)
+                per_dim_q[j] = np.sort(res_j)[k_j - 1]
+            mu_hat, sigma_hat = _compute_standardization_stats(res, zcm, sdim)
+            tmp_scores = CalibratedScores(
+                dimensions=cal_data.dimensions, residuals=res,
+                mu_hat=mu_hat, sigma_hat=sigma_hat, n_cal=n,
+                method=predictor.method, alpha=a,
+                zero_claim_mask=zcm, severity_dim=sdim,
+                per_dim_quantiles=per_dim_q,
+            )
+
+        tmp_pred.calibrated_scores_ = tmp_scores
         tmp_pred.dimensions_ = cal_data.dimensions
 
         report = coverage_report(tmp_pred, X_test, Y_test, exposure=exposure)
@@ -220,7 +240,6 @@ def calibration_plot(
 
     fig, axes = plt.subplots(1, 2, figsize=figsize)
 
-    # Joint coverage
     ax = axes[0]
     ax.plot(1 - alphas, joint_coverages, "o-", label="Empirical joint", markersize=4)
     ax.plot([0.7, 1.0], [0.7, 1.0], "k--", alpha=0.5, label="Diagonal (perfect)")
@@ -230,7 +249,6 @@ def calibration_plot(
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Marginal coverage per dimension
     ax2 = axes[1]
     for k, cov_list in marginal_coverages_by_dim.items():
         ax2.plot(1 - alphas, cov_list, "o-", label=k, markersize=4)
